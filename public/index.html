@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>代理使用说明</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 720px;
+    margin: 48px auto;
+    padding: 0 20px;
+    line-height: 1.75;
+    color: #222;
+  }
+  h1 { font-size: 1.5em; font-weight: 600; margin-bottom: 24px; }
+  h2 { font-size: 1.1em; font-weight: 600; margin-top: 32px; }
+  p, li { font-size: 0.95em; }
+  code, pre {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    background: #f4f4f4;
+    border-radius: 4px;
+  }
+  code { padding: 1px 5px; font-size: 0.88em; }
+  pre {
+    padding: 12px 14px;
+    overflow-x: auto;
+    font-size: 0.85em;
+    line-height: 1.55;
+    border: 1px solid #eee;
+  }
+  ul { padding-left: 22px; }
+  li { margin: 3px 0; }
+  hr { border: none; border-top: 1px solid #eee; margin: 32px 0; }
+  .note { color: #666; font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>代理使用说明</h1>
+
+<p>本服务提供文件下载代理与 API 透传代理。</p>
+
+<h2>使用方法</h2>
+
+<p>把需要访问的完整地址接在本服务域名后面：</p>
+
+<pre>https://本服务域名/https://目标地址</pre>
+
+<p>例如：</p>
+
+<pre>https://本服务域名/https://github.com/user/repo/releases/download/v1.0/file.zip</pre>
+
+<p>协议头可省略，默认按 https 处理：</p>
+
+<pre>https://本服务域名/github.com/user/repo/raw/main/file.txt</pre>
+
+<h2>支持范围</h2>
+
+<ul>
+  <li>请求方式：GET、POST</li>
+  <li>查询参数原样透传</li>
+  <li>请求头原样透传（部分必要字段除外）</li>
+  <li>下载：自动多分片并发，边下边传</li>
+  <li>API：请求与响应双向透传</li>
+  <li>POST 请求体上限 4 MB</li>
+</ul>
+
+<h2>允许的域名</h2>
+
+<p>目前仅允许下列域名及其子域名。</p>
+
+<p>微软系：</p>
+<ul>
+  <li>microsoft.com、azure.com、windows.net、live.com</li>
+  <li>office.com、office365.com、sharepoint.com、onedrive.com</li>
+  <li>msn.com、bing.com、visualstudio.com、vscode.dev</li>
+  <li>github.com、githubusercontent.com、githubassets.com、github.io</li>
+  <li>blob.core.windows.net</li>
+</ul>
+
+<p>Google 系：</p>
+<ul>
+  <li>google.com、googleapis.com、gstatic.com、googlevideo.com</li>
+  <li>youtube.com、ytimg.com、ggpht.com、googleusercontent.com</li>
+  <li>gvt1.com、gvt2.com、gvt3.com</li>
+  <li>blogspot.com、blogger.com、android.com</li>
+</ul>
+
+<h2>限制</h2>
+
+<ul>
+  <li>禁止访问内网地址</li>
+  <li>POST 请求体超过 4 MB 将被拒绝</li>
+  <li>大文件上传请先上传到网盘或对象存储，再提供链接</li>
+  <li>单次请求最长执行时间约 280 秒</li>
+</ul>
+
+<h2>错误响应</h2>
+
+<p>所有错误以纯文本返回，两行：第一行中文，第二行英文。</p>
+
+<pre>请求体过大，超过 4 MB 限制，请先上传成文件再提供链接
+Payload too large, exceeds 4 MB limit. Please upload the file first and provide a link.</pre>
+
+<h2>示例</h2>
+
+<p>下载文件：</p>
+
+<pre>curl -O https://本服务域名/https://github.com/user/repo/releases/download/v1.0/file.zip</pre>
+
+<p>调用 API：</p>
+
+<pre>curl -X POST https://本服务域名/https://api.github.com/repos/user/repo/issues \
+  -H "Content-Type: application/json" \
+  -d '{"title":"hello"}'</pre>
+
+<hr>
+
+<p class="note">本服务仅供个人使用。</p>
+
+</body>
+</html>
