@@ -24,6 +24,7 @@ const MAX_INFLIGHT = 4;
 const MAX_CONCURRENCY = 4;
 const MAX_REDIRECTS = 5;
 const REWRITE_SCRIPT = true;
+const VIDEO_PREVIEW_BYTES = 512 * 1024;
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -33,14 +34,43 @@ const CORS_HEADERS = {
   'Access-Control-Max-Age': '86400'
 };
 
+// ═══════════════════════════════════════════════
+// 白名单
+// ═══════════════════════════════════════════════
 const WHITELIST_DOMAINS = [
+  // 微软系
   'microsoft.com', 'azure.com', 'windows.net', 'live.com', 'office.com',
   'office365.com', 'sharepoint.com', 'onedrive.com', 'msn.com', 'bing.com',
-  'visualstudio.com', 'vscode.dev', 'github.com', 'githubusercontent.com',
-  'githubassets.com', 'github.io', 'blob.core.windows.net',
+  'visualstudio.com', 'vscode.dev', 'blob.core.windows.net',
+  // Google 系
   'google.com', 'googleapis.com', 'gstatic.com', 'googlevideo.com',
   'youtube.com', 'ytimg.com', 'ggpht.com', 'googleusercontent.com',
   'gvt1.com', 'gvt2.com', 'gvt3.com', 'blogspot.com', 'blogger.com', 'android.com',
+  // GitHub
+  'github.com', 'githubusercontent.com', 'githubassets.com', 'github.io',
+  // Netlify 系
+  'netlify.com', 'netlify.app', 'netlify.dev', 'netlify-cdn.com',
+  // Vercel 系
+  'vercel.com', 'vercel.app', 'vercel.dev', 'now.sh', 'vercel-dns.com',
+  // OpenAI 系
+  'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com',
+  'openai.azure.com', 'sora.com',
+  // Cloudflare 系
+  'cloudflare.com', 'cloudflare.net', 'cloudflareinsights.com',
+  'cdnjs.com', 'workers.dev', 'pages.dev', 'cloudflarestream.com',
+  'r2.dev', 'cfdata.org', 'cloudflareclient.com',
+  // 自定义
+  '344977.xyz',
+  // 机器人 / 消息平台
+  'discord.com', 'discordapp.com', 'discordapp.net', 'discord.gg',
+  'telegram.org', 't.me', 'telegram.me',
+  'slack.com', 'slack-edge.com', 'slack-files.com', 'slack-imgs.com',
+  'line.me', 'line-scdn.net',
+  'wechat.com', 'weixin.qq.com', 'qpic.cn', 'qlogo.cn',
+  'meta.com', 'facebook.com', 'fbcdn.net', 'whatsapp.com', 'whatsapp.net',
+  'twitter.com', 'x.com', 'twimg.com',
+  'reddit.com', 'redd.it', 'redditstatic.com',
+  // 包管理
   'npmjs.org', 'npmjs.com', 'registry.npmjs.org', 'pypi.org', 'pythonhosted.org'
 ];
 
@@ -132,10 +162,39 @@ const SECURE_AGENT = new Agent({
 });
 
 // ═══════════════════════════════════════════════
+// MIME 判定
+// ═══════════════════════════════════════════════
+function getMimeType(ct) {
+  if (!ct) return '';
+  try { return contentType.parse(ct).type.toLowerCase(); } catch {
+    const m = /^\s*([a-z0-9!#$&\-^_.+]+\/[a-z0-9!#$&\-^_.+]+)/i.exec(ct);
+    return m ? m[1].toLowerCase() : '';
+  }
+}
+
+function isHtmlMime(m) {
+  return m === 'text/html' || m === 'application/xhtml+xml';
+}
+
+function isVideoMime(m) {
+  return m.startsWith('video/');
+}
+
+function isUnrestrictedMime(m) {
+  if (m.startsWith('image/')) return true;
+  if (m.startsWith('audio/')) return true;
+  if (m.startsWith('font/')) return true;
+  if (m === 'text/css') return true;
+  if (m === 'text/javascript' || m === 'application/javascript'
+      || m === 'application/x-javascript' || m === 'application/ecmascript') return true;
+  if (m === 'application/json' || m === 'text/plain') return true;
+  return false;
+}
+
+// ═══════════════════════════════════════════════
 // 主入口
 // ═══════════════════════════════════════════════
 module.exports = async function handler(req, res) {
-  // 健康检查
   if (req.url === '/__health__') {
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/plain');
@@ -160,10 +219,7 @@ module.exports = async function handler(req, res) {
   } catch (err) {
     const code = err && err.code;
     const msg = (err && err.message) || 'unknown';
-    if (res.headersSent) {
-      try { res.destroy(); } catch (_) {}
-      return;
-    }
+    if (res.headersSent) { try { res.destroy(); } catch (_) {} return; }
     if (code === 'SSRF_BLOCKED') return sendError(res, 403, '禁止访问内网地址');
     if (code === 'NOT_WHITELISTED') return sendError(res, 403, '目标域名不在白名单内');
     if (code === 'DNS_FAILED') return sendError(res, 502, '域名解析失败');
@@ -171,9 +227,6 @@ module.exports = async function handler(req, res) {
   }
 };
 
-// ═══════════════════════════════════════════════
-// 请求处理
-// ═══════════════════════════════════════════════
 async function handleRequest(req, res, { targetUrl, parsedUrl, options }) {
   if (!options.white && WHITELIST_ENABLED) {
     if (!isWhitelisted(parsedUrl.hostname, WHITELIST_DOMAINS)) {
@@ -191,7 +244,7 @@ async function handleRequest(req, res, { targetUrl, parsedUrl, options }) {
 }
 
 // ═══════════════════════════════════════════════
-// safeFetch：手动重定向 + 每跳白名单
+// safeFetch
 // ═══════════════════════════════════════════════
 async function safeFetch(rawUrl, init, options) {
   let current = rawUrl;
@@ -210,8 +263,7 @@ async function safeFetch(rawUrl, init, options) {
     }
 
     const res = await undiciFetch(current, {
-      method,
-      body,
+      method, body,
       headers: baseHeaders,
       redirect: 'manual',
       signal: init.signal,
@@ -221,7 +273,7 @@ async function safeFetch(rawUrl, init, options) {
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       const loc = res.headers.get('location');
       if (!loc) return res;
-      try { res.body && res.body.cancel(); } catch (_) {}
+      cancelBody(res);
       if (++redirects > MAX_REDIRECTS) throw new Error('重定向次数过多');
 
       if (res.status === 303 ||
@@ -238,11 +290,13 @@ async function safeFetch(rawUrl, init, options) {
 }
 
 // ═══════════════════════════════════════════════
-// GET / HEAD
+// GET / HEAD —— 按 MIME 分流
 // ═══════════════════════════════════════════════
 async function handleDownload(req, res, targetUrl, options) {
   const headers = buildForwardHeaders(req);
+  const isHead = req.method === 'HEAD';
 
+  // 探测：Range: 0-0 判断是否支持分片，同时拿到 Content-Type
   let probe;
   try {
     probe = await safeFetch(targetUrl, {
@@ -257,22 +311,178 @@ async function handleDownload(req, res, targetUrl, options) {
   const probeCT = probe.headers.get('content-type') || '';
   const probeCR = probe.headers.get('content-range') || '';
   const probeStatus = probe.status;
-  try { probe.body && probe.body.cancel(); } catch (_) {}
+  const mime = getMimeType(probeCT);
+  cancelBody(probe);
 
-  if (isHtmlContentType(probeCT)) {
+  // HEAD：不再拉 body，直接转发头
+  if (isHead) {
+    return handleHead(req, res, targetUrl, headers, options);
+  }
+
+  // 1) HTML → 重写
+  if (isHtmlMime(mime)) {
     return handleHtml(req, res, targetUrl, headers, options);
   }
 
+  // 2) 视频 → 只取第一帧
+  if (isVideoMime(mime)) {
+    return handleVideoPreview(req, res, targetUrl, headers, options);
+  }
+
+  // 3) JS / CSS / 图片 / 音频 → 完整代理（优先分片）
+  if (isUnrestrictedMime(mime)) {
+    if (probeStatus === 206) {
+      const totalSize = parseContentRangeTotal(probeCR);
+      if (totalSize > 1) {
+        return streamMultiChunk(req, res, targetUrl, headers, totalSize, probe.headers, options);
+      }
+    }
+    return streamFallback(req, res, targetUrl, headers, options);
+  }
+
+  // 4) 其它类型 → 完整代理
   if (probeStatus === 206) {
     const totalSize = parseContentRangeTotal(probeCR);
     if (totalSize > 1) {
       return streamMultiChunk(req, res, targetUrl, headers, totalSize, probe.headers, options);
     }
   }
-
   return streamFallback(req, res, targetUrl, headers, options);
 }
 
+// ── HEAD：纯头转发 ──
+async function handleHead(req, res, targetUrl, headers, options) {
+  let response;
+  try {
+    response = await safeFetch(targetUrl, {
+      method: 'HEAD',
+      headers,
+      signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
+    }, options);
+  } catch (err) {
+    return sendError(res, 502, `无法连接源站：${err.message}`);
+  }
+
+  res.statusCode = response.status;
+  for (const [k, v] of response.headers) {
+    const lk = k.toLowerCase();
+    if (HOP_BY_HOP.has(lk)) continue;
+    res.setHeader(k, v);
+  }
+  for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+
+  cancelBody(response);
+  res.end();
+}
+
+// ═══════════════════════════════════════════════
+// 视频预览：只取前 VIDEO_PREVIEW_BYTES 字节
+// ═══════════════════════════════════════════════
+async function handleVideoPreview(req, res, targetUrl, headers, options) {
+  const previewLimit = VIDEO_PREVIEW_BYTES;
+
+  let start = 0;
+  let end = previewLimit - 1;
+
+  const clientRange = req.headers['range'];
+  if (clientRange) {
+    const m = /^bytes=(\d+)-(\d*)/.exec(clientRange);
+    if (m) {
+      const s = parseInt(m[1], 10);
+      if (Number.isFinite(s)) {
+        if (s >= previewLimit) {
+          res.statusCode = 416;
+          res.setHeader('Content-Range', `bytes */${previewLimit}`);
+          res.setHeader('Accept-Ranges', 'bytes');
+          for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+          return res.end();
+        }
+        start = s;
+        if (m[2]) {
+          const e = parseInt(m[2], 10);
+          if (Number.isFinite(e)) end = Math.min(end, e);
+        }
+      }
+    }
+  }
+
+  let response;
+  try {
+    response = await safeFetch(targetUrl, {
+      method: 'GET',
+      headers: { ...headers, Range: `bytes=${start}-${end}` },
+      signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
+    }, options);
+  } catch (err) {
+    return sendError(res, 502, `无法连接源站：${err.message}`);
+  }
+
+  if (response.status !== 200 && response.status !== 206) {
+    return relayResponse(response, res);
+  }
+
+  // 流式限额读取：无论源站是否支持 Range，最多读 limit 字节
+  const limit = end - start + 1;
+  let bodyBuf;
+  try {
+    bodyBuf = await readLimitedBody(response, limit);
+  } catch (err) {
+    return sendError(res, 502, `读取视频失败：${err.message}`);
+  }
+
+  if (bodyBuf.length === 0) {
+    return sendError(res, 502, '视频源站返回空响应');
+  }
+
+  const totalSize = parseContentRangeTotal(response.headers.get('content-range') || '');
+  const realEnd = start + bodyBuf.length - 1;
+
+  res.statusCode = 206;
+  res.setHeader('Content-Type', response.headers.get('content-type') || 'video/mp4');
+  res.setHeader('Content-Length', String(bodyBuf.length));
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader(
+    'Content-Range',
+    totalSize > 0
+      ? `bytes ${start}-${realEnd}/${totalSize}`
+      : `bytes ${start}-${realEnd}/*`
+  );
+  res.setHeader('X-Preview-Only', 'first-frame');
+  res.setHeader('X-Preview-Bytes', String(VIDEO_PREVIEW_BYTES));
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+  res.end(bodyBuf);
+}
+
+// 流式读取，上限 limit 字节，超出即取消
+async function readLimitedBody(response, limit) {
+  if (!response.body) return Buffer.alloc(0);
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+
+  try {
+    while (total < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.length) {
+        chunks.push(Buffer.from(value));
+        total += value.length;
+      }
+    }
+  } finally {
+    try { await reader.cancel(); } catch (_) {}
+    try { reader.releaseLock(); } catch (_) {}
+  }
+
+  const full = Buffer.concat(chunks, Math.min(total, limit));
+  return full.length > limit ? full.subarray(0, limit) : full;
+}
+
+// ═══════════════════════════════════════════════
+// 通用流式回源
+// ═══════════════════════════════════════════════
 async function streamFallback(req, res, targetUrl, headers, options) {
   let response;
   try {
@@ -303,7 +513,7 @@ async function handleHtml(req, res, targetUrl, headers, options) {
   }
 
   const ctRaw = response.headers.get('content-type') || '';
-  if (!isHtmlContentType(ctRaw)) return relayResponse(response, res);
+  if (!isHtmlMime(getMimeType(ctRaw))) return relayResponse(response, res);
 
   const enc = response.headers.get('content-encoding');
   if (enc && enc !== 'identity') return relayResponse(response, res);
@@ -311,17 +521,24 @@ async function handleHtml(req, res, targetUrl, headers, options) {
   const declaredLen = parseInt(response.headers.get('content-length') || '0', 10);
   if (declaredLen > HTML_MAX_BYTES) return relayResponse(response, res);
 
+  // 读取前最后一次检查：这里之后不能再 relayResponse
   let rawBuf;
   try {
     rawBuf = Buffer.from(await response.arrayBuffer());
   } catch (err) {
     return sendError(res, 502, `读取 HTML 失败：${err.message}`);
   }
-  if (rawBuf.length > HTML_MAX_BYTES) return relayResponse(response, res);
+
+  // body 已被消费，超限 / 重写失败都直接返回已读 buffer
+  if (rawBuf.length > HTML_MAX_BYTES) {
+    return sendBufferedResponse(res, response, rawBuf);
+  }
 
   const finalUrl = response.url || targetUrl;
   const outBuf = rewriteHtmlBody(rawBuf, ctRaw, finalUrl, options);
-  if (!outBuf) return relayResponse(response, res);
+  if (!outBuf) {
+    return sendBufferedResponse(res, response, rawBuf);
+  }
 
   res.statusCode = response.status;
   for (const [k, v] of response.headers) {
@@ -344,6 +561,20 @@ async function handleHtml(req, res, targetUrl, headers, options) {
   res.end(outBuf);
 }
 
+// body 已消费后，直接把 buffer 返回（保持原 Content-Type / charset）
+function sendBufferedResponse(res, response, buf) {
+  res.statusCode = response.status;
+  for (const [k, v] of response.headers) {
+    const lk = k.toLowerCase();
+    if (HOP_BY_HOP.has(lk)) continue;
+    if (lk === 'content-length') continue;
+    res.setHeader(k, v);
+  }
+  res.setHeader('Content-Length', String(buf.length));
+  for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+  res.end(buf);
+}
+
 // ═══════════════════════════════════════════════
 // 多分片下载
 // ═══════════════════════════════════════════════
@@ -355,6 +586,15 @@ async function streamMultiChunk(req, res, targetUrl, headers, totalSize, upstrea
   res.setHeader('Content-Type', upstreamHeaders.get('content-type') || 'application/octet-stream');
   res.setHeader('Content-Length', String(totalSize));
   res.setHeader('Accept-Ranges', 'bytes');
+
+  // 转发上游非敏感响应头
+  for (const [k, v] of upstreamHeaders) {
+    const lk = k.toLowerCase();
+    if (HOP_BY_HOP.has(lk)) continue;
+    if (lk === 'content-length' || lk === 'content-type'
+        || lk === 'content-range' || lk === 'accept-ranges') continue;
+    res.setHeader(k, v);
+  }
   for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
 
   const buffers = new Array(chunkCount).fill(null);
@@ -380,7 +620,7 @@ async function streamMultiChunk(req, res, targetUrl, headers, totalSize, upstrea
           const chunk = buffers[writeIndex];
           buffers[writeIndex] = null;
           try {
-            if (!res.write(chunk)) await new Promise((r) => res.once('drain', r));
+            await writeWithBackpressure(res, chunk);
           } catch (e) { failed = e; return; }
           writeIndex++;
         }
@@ -393,6 +633,25 @@ async function streamMultiChunk(req, res, targetUrl, headers, totalSize, upstrea
 
   if (failed && !aborted) { try { res.destroy(); } catch (_) {} return; }
   if (!aborted) { try { res.end(); } catch (_) {} }
+}
+
+// 带背压的写入：res 关闭 / 出错 / drain 三事件竞速
+function writeWithBackpressure(res, chunk) {
+  if (res.write(chunk)) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    const onDrain = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); reject(new Error('client closed')); };
+    const onError = (err) => { cleanup(); reject(err); };
+    const cleanup = () => {
+      res.off('drain', onDrain);
+      res.off('close', onClose);
+      res.off('error', onError);
+    };
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    res.once('error', onError);
+  });
 }
 
 async function fetchChunkWithRetry(targetUrl, headers, range, options) {
@@ -415,12 +674,12 @@ async function fetchChunkWithRetry(targetUrl, headers, range, options) {
 
     if (response.status === 429 || response.status >= 500) {
       lastErr = new Error(`HTTP ${response.status}`);
-      try { response.body && response.body.cancel(); } catch (_) {}
+      cancelBody(response);
       await sleep(400 * Math.pow(2, attempt) + Math.random() * 200);
       continue;
     }
     if (response.status !== 206) {
-      try { response.body && response.body.cancel(); } catch (_) {}
+      cancelBody(response);
       throw new Error(`源站不支持分片：HTTP ${response.status}`);
     }
     try { return Buffer.from(await response.arrayBuffer()); }
@@ -516,10 +775,13 @@ async function readRequestBody(req) {
 async function relayResponse(response, res) {
   res.statusCode = response.status;
 
+  const contentEnc = response.headers.get('content-encoding');
+  const skipLength = contentEnc && contentEnc !== 'identity';
+
   for (const [key, value] of response.headers) {
     const lower = key.toLowerCase();
     if (HOP_BY_HOP.has(lower)) continue;
-    if (lower === 'content-length' && response.headers.get('content-encoding')) continue;
+    if (lower === 'content-length' && skipLength) continue;
     res.setHeader(key, value);
   }
   for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
@@ -541,13 +803,21 @@ async function relayResponse(response, res) {
   });
 }
 
+// 统一取消 body 的安全封装
+function cancelBody(response) {
+  try {
+    if (response && response.body && typeof response.body.cancel === 'function') {
+      response.body.cancel().catch(() => {});
+    }
+  } catch (_) {}
+}
+
 // ═══════════════════════════════════════════════
 // URL 解析
 // ═══════════════════════════════════════════════
 function parseRequest(req) {
   const raw = req.url || '';
 
-  // 标准代理模式：GET http://example.com/path HTTP/1.1
   if (/^https?:\/\//i.test(raw)) {
     try {
       const u = new URL(raw);
@@ -557,7 +827,6 @@ function parseRequest(req) {
     } catch { return null; }
   }
 
-  // 路径模式：/https://example.com/path
   const qIdx = raw.indexOf('?');
   let path = qIdx >= 0 ? raw.slice(0, qIdx) : raw;
   let queryStr = qIdx >= 0 ? raw.slice(qIdx + 1) : '';
@@ -610,16 +879,6 @@ function extractWhite(query) {
 // ═══════════════════════════════════════════════
 // HTML 重写
 // ═══════════════════════════════════════════════
-function isHtmlContentType(ct) {
-  if (!ct) return false;
-  try {
-    const m = contentType.parse(ct).type;
-    return m === 'text/html' || m === 'application/xhtml+xml';
-  } catch {
-    return /^\s*(?:text\/html|application\/xhtml)/i.test(ct);
-  }
-}
-
 function detectCharset(buf, httpCT) {
   if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) return 'utf-8';
   if (buf.length >= 2 && buf[0] === 0xFE && buf[1] === 0xFF) return 'utf-16be';
@@ -687,9 +946,28 @@ const URL_ATTRS = new Set([
   'cite', 'longdesc', 'usemap', 'manifest', 'ping'
 ]);
 
+function tuneVideoTag(node, ctx) {
+  if (!node.attrs) return;
+
+  node.attrs = node.attrs.filter((a) => a.name.toLowerCase() !== 'autoplay');
+
+  const has = node.attrs.find((a) => a.name.toLowerCase() === 'preload');
+  if (has) has.value = 'metadata';
+  else node.attrs.push({ name: 'preload', value: 'metadata' });
+
+  const poster = node.attrs.find((a) => a.name.toLowerCase() === 'poster');
+  if (poster) {
+    poster.value = toProxyUrl(poster.value, ctx, { keepHash: false });
+  }
+}
+
 function rewriteDom(doc, ctx) {
   walkNode(doc, (node) => {
     if (!node.tagName || !node.attrs) return;
+
+    if (node.tagName === 'video') {
+      tuneVideoTag(node, ctx);
+    }
 
     for (const attr of node.attrs) {
       const n = attr.name.toLowerCase();
@@ -852,8 +1130,9 @@ function rewriteInlineScript(src, ctx) {
 function isLikelyUrl(s) {
   if (!s || s.length < 4) return false;
   if (/^https?:\/\//i.test(s)) return true;
-  if (/^\/[^/*]/.test(s)) return true;
-  if (/^\.\.?\//.test(s)) return true;
+  if (/^\/\//.test(s)) return true;                 // 协议相对 URL
+  if (/^\/[^/*]/.test(s)) return true;              // 站内绝对路径
+  if (/^\.\.?\//.test(s)) return true;              // 相对路径
   return false;
 }
 
@@ -889,7 +1168,8 @@ function buildForwardHeaders(req, override = {}) {
   const headers = {};
   const skip = new Set([
     'host', 'connection', 'content-length',
-    'transfer-encoding', 'proxy-authorization'
+    'transfer-encoding', 'proxy-authorization',
+    'range', 'if-range'                          // 由函数内部按需生成
   ]);
   for (const [k, v] of Object.entries(req.headers)) {
     if (skip.has(k.toLowerCase())) continue;
@@ -901,8 +1181,10 @@ function buildForwardHeaders(req, override = {}) {
 
 function sendError(res, statusCode, msg) {
   if (res.headersSent) { try { res.destroy(); } catch (_) {} return; }
+  const body = Buffer.from(msg + '\n', 'utf8');
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Length', String(body.length));
   for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
-  res.end(msg + '\n');
+  res.end(body);
 }
