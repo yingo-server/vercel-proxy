@@ -12,6 +12,42 @@ const acorn = require('acorn');
 const walk = require('acorn-walk');
 
 // ═══════════════════════════════════════════════
+// 日志
+// ═══════════════════════════════════════════════
+const LOG_ENABLED = process.env.PROXY_LOG !== 'off';
+let __reqSeq = 0;
+
+function newTag() {
+  return 'r' + (++__reqSeq).toString(36);
+}
+
+function log(tag, stage, msg, meta) {
+  if (!LOG_ENABLED) return;
+  const line = ['[proxy]', tag, stage, msg];
+  if (meta !== undefined) {
+    try { line.push(JSON.stringify(meta)); }
+    catch { line.push(String(meta)); }
+  }
+  console.log(line.join(' '));
+}
+
+function logErr(tag, stage, msg, err) {
+  const meta = {};
+  if (err) {
+    meta.message = err.message;
+    if (err.code) meta.code = err.code;
+    if (err.name) meta.name = err.name;
+    if (err.stack) meta.stack = String(err.stack).split('\n').slice(0, 3).join(' | ');
+  }
+  console.error(['[proxy]', tag, stage, msg, JSON.stringify(meta)].join(' '));
+}
+
+function briefUrl(u, max = 120) {
+  if (typeof u !== 'string') return String(u);
+  return u.length > max ? u.slice(0, max) + '...' : u;
+}
+
+// ═══════════════════════════════════════════════
 // 配置
 // ═══════════════════════════════════════════════
 const WHITELIST_ENABLED = true;
@@ -38,30 +74,29 @@ const CORS_HEADERS = {
 // 白名单
 // ═══════════════════════════════════════════════
 const WHITELIST_DOMAINS = [
-  // 微软系
   'microsoft.com', 'azure.com', 'windows.net', 'live.com', 'office.com',
   'office365.com', 'sharepoint.com', 'onedrive.com', 'msn.com', 'bing.com',
   'visualstudio.com', 'vscode.dev', 'blob.core.windows.net',
-  // Google 系
+
   'google.com', 'googleapis.com', 'gstatic.com', 'googlevideo.com',
   'youtube.com', 'ytimg.com', 'ggpht.com', 'googleusercontent.com',
   'gvt1.com', 'gvt2.com', 'gvt3.com', 'blogspot.com', 'blogger.com', 'android.com',
-  // GitHub
+
   'github.com', 'githubusercontent.com', 'githubassets.com', 'github.io',
-  // Netlify 系
+
   'netlify.com', 'netlify.app', 'netlify.dev', 'netlify-cdn.com',
-  // Vercel 系
+
   'vercel.com', 'vercel.app', 'vercel.dev', 'now.sh', 'vercel-dns.com',
-  // OpenAI 系
+
   'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com',
   'openai.azure.com', 'sora.com',
-  // Cloudflare 系
+
   'cloudflare.com', 'cloudflare.net', 'cloudflareinsights.com',
   'cdnjs.com', 'workers.dev', 'pages.dev', 'cloudflarestream.com',
   'r2.dev', 'cfdata.org', 'cloudflareclient.com',
-  // 自定义
+
   '344977.xyz',
-  // 机器人 / 消息平台
+
   'discord.com', 'discordapp.com', 'discordapp.net', 'discord.gg',
   'telegram.org', 't.me', 'telegram.me',
   'slack.com', 'slack-edge.com', 'slack-files.com', 'slack-imgs.com',
@@ -70,7 +105,7 @@ const WHITELIST_DOMAINS = [
   'meta.com', 'facebook.com', 'fbcdn.net', 'whatsapp.com', 'whatsapp.net',
   'twitter.com', 'x.com', 'twimg.com',
   'reddit.com', 'redd.it', 'redditstatic.com',
-  // 包管理
+
   'npmjs.org', 'npmjs.com', 'registry.npmjs.org', 'pypi.org', 'pythonhosted.org'
 ];
 
@@ -114,13 +149,14 @@ function isWhitelisted(hostname, list) {
   return false;
 }
 
-async function resolveSafe(hostname) {
+async function resolveSafe(hostname, tag) {
   let host = String(hostname);
   if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
 
   const v = net.isIP(host);
   if (v > 0) {
     if (isPrivateAddress(host)) {
+      if (tag) log(tag, 'dns', 'ip literal blocked', { host });
       throw Object.assign(new Error('SSRF_BLOCKED'), { code: 'SSRF_BLOCKED' });
     }
     return [{ address: host, family: v }];
@@ -130,26 +166,49 @@ async function resolveSafe(hostname) {
   try {
     addrs = await dns.promises.lookup(host, { all: true, verbatim: true });
   } catch (e) {
+    if (tag) log(tag, 'dns', 'lookup failed', { host, err: e.message });
     throw Object.assign(new Error('DNS_FAILED'), { code: 'DNS_FAILED' });
   }
   if (!addrs || addrs.length === 0) {
+    if (tag) log(tag, 'dns', 'empty result', { host });
     throw Object.assign(new Error('DNS_EMPTY'), { code: 'DNS_EMPTY' });
   }
+
   const safe = addrs.filter((a) => !isPrivateAddress(a.address));
   if (safe.length === 0) {
+    if (tag) log(tag, 'dns', 'all private', { host, resolved: addrs.map((a) => a.address) });
     throw Object.assign(new Error('SSRF_BLOCKED'), { code: 'SSRF_BLOCKED' });
   }
+  if (tag) log(tag, 'dns', 'ok', { host, addrs: safe.map((a) => a.address) });
   return safe;
 }
 
 // ═══════════════════════════════════════════════
-// 安全 Agent：DNS 与 TCP 连接绑定（无 TOCTOU）
+// 安全 Agent
+// undici 调用 lookup 时始终传 { all: true }，要求回调返回记录数组
 // ═══════════════════════════════════════════════
 const SECURE_AGENT = new Agent({
   connect: {
     lookup(hostname, options, callback) {
+      const wantAll = !options || options.all === true;
+      const wantFamily =
+        options && (options.family === 4 || options.family === 6)
+          ? options.family
+          : 0;
+
       resolveSafe(hostname).then((addrs) => {
-        callback(null, addrs[0].address, addrs[0].family);
+        let list = addrs;
+        if (wantFamily) {
+          list = addrs.filter((a) => a.family === wantFamily);
+          if (list.length === 0) {
+            return callback(new Error('NO_MATCHING_FAMILY'));
+          }
+        }
+        if (wantAll) {
+          callback(null, list.map((a) => ({ address: a.address, family: a.family })));
+        } else {
+          callback(null, list[0].address, list[0].family);
+        }
       }).catch((err) => callback(err));
     }
   },
@@ -162,7 +221,7 @@ const SECURE_AGENT = new Agent({
 });
 
 // ═══════════════════════════════════════════════
-// MIME 判定
+// MIME
 // ═══════════════════════════════════════════════
 function getMimeType(ct) {
   if (!ct) return '';
@@ -195,6 +254,9 @@ function isUnrestrictedMime(m) {
 // 主入口
 // ═══════════════════════════════════════════════
 module.exports = async function handler(req, res) {
+  const tag = newTag();
+  const startedAt = Date.now();
+
   if (req.url === '/__health__') {
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/plain');
@@ -202,51 +264,82 @@ module.exports = async function handler(req, res) {
   }
 
   if (req.method === 'OPTIONS') {
+    log(tag, 'entry', 'preflight', { method: req.method, url: briefUrl(req.url) });
     res.writeHead(204, CORS_HEADERS);
     return res.end();
   }
+
+  log(tag, 'entry', 'request', {
+    method: req.method,
+    url: briefUrl(req.url),
+    ua: req.headers && req.headers['user-agent'] ? briefUrl(req.headers['user-agent'], 60) : undefined
+  });
 
   let parsed;
   try {
     parsed = parseRequest(req);
   } catch (e) {
+    logErr(tag, 'parse', 'failed', e);
     return sendError(res, 400, `请求解析失败：${e.message}`);
   }
-  if (!parsed) return sendError(res, 400, '无法解析目标地址');
+  if (!parsed) {
+    log(tag, 'parse', 'unresolvable', { url: briefUrl(req.url) });
+    return sendError(res, 400, '无法解析目标地址');
+  }
+
+  log(tag, 'parse', 'ok', {
+    target: briefUrl(parsed.targetUrl),
+    host: parsed.parsedUrl.hostname,
+    white: !!parsed.options.white
+  });
 
   try {
-    await handleRequest(req, res, parsed);
+    await handleRequest(req, res, parsed, tag);
+    log(tag, 'done', 'completed', {
+      status: res.statusCode,
+      ms: Date.now() - startedAt
+    });
   } catch (err) {
     const code = err && err.code;
     const msg = (err && err.message) || 'unknown';
-    if (res.headersSent) { try { res.destroy(); } catch (_) {} return; }
-    if (code === 'SSRF_BLOCKED') return sendError(res, 403, '禁止访问内网地址');
-    if (code === 'NOT_WHITELISTED') return sendError(res, 403, '目标域名不在白名单内');
-    if (code === 'DNS_FAILED') return sendError(res, 502, '域名解析失败');
-    sendError(res, 502, `上游错误：${msg}`);
+    logErr(tag, 'handler', 'threw', err);
+
+    if (res.headersSent) {
+      try { res.destroy(); } catch (_) {}
+      return;
+    }
+    if (code === 'SSRF_BLOCKED') return sendError(res, 403, '禁止访问内网地址', tag);
+    if (code === 'NOT_WHITELISTED') return sendError(res, 403, '目标域名不在白名单内', tag);
+    if (code === 'DNS_FAILED') return sendError(res, 502, '域名解析失败', tag);
+    sendError(res, 502, `上游错误：${msg}`, tag);
   }
 };
 
-async function handleRequest(req, res, { targetUrl, parsedUrl, options }) {
+async function handleRequest(req, res, { targetUrl, parsedUrl, options }, tag) {
   if (!options.white && WHITELIST_ENABLED) {
     if (!isWhitelisted(parsedUrl.hostname, WHITELIST_DOMAINS)) {
-      return sendError(res, 403, '目标域名不在白名单内');
+      log(tag, 'whitelist', 'rejected', { host: parsedUrl.hostname });
+      return sendError(res, 403, '目标域名不在白名单内', tag);
     }
+    log(tag, 'whitelist', 'passed', { host: parsedUrl.hostname });
+  } else if (options.white) {
+    log(tag, 'whitelist', 'bypassed by white=Y', { host: parsedUrl.hostname });
   }
 
   if (req.method === 'GET' || req.method === 'HEAD') {
-    return handleDownload(req, res, targetUrl, options);
+    return handleDownload(req, res, targetUrl, options, tag);
   }
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
-    return handleForward(req, res, targetUrl, options);
+    return handleForward(req, res, targetUrl, options, tag);
   }
-  return sendError(res, 405, `不支持的请求方法：${req.method}`);
+  log(tag, 'method', 'not allowed', { method: req.method });
+  return sendError(res, 405, `不支持的请求方法：${req.method}`, tag);
 }
 
 // ═══════════════════════════════════════════════
 // safeFetch
 // ═══════════════════════════════════════════════
-async function safeFetch(rawUrl, init, options) {
+async function safeFetch(rawUrl, init, options, tag) {
   let current = rawUrl;
   let redirects = 0;
   let method = (init.method || 'GET').toUpperCase();
@@ -262,19 +355,37 @@ async function safeFetch(rawUrl, init, options) {
       }
     }
 
-    const res = await undiciFetch(current, {
-      method, body,
-      headers: baseHeaders,
-      redirect: 'manual',
-      signal: init.signal,
-      dispatcher: SECURE_AGENT
+    const t0 = Date.now();
+    let res;
+    try {
+      res = await undiciFetch(current, {
+        method, body,
+        headers: baseHeaders,
+        redirect: 'manual',
+        signal: init.signal,
+        dispatcher: SECURE_AGENT
+      });
+    } catch (e) {
+      if (tag) logErr(tag, 'fetch', 'network error', e);
+      throw e;
+    }
+
+    if (tag) log(tag, 'fetch', 'response', {
+      url: briefUrl(current),
+      status: res.status,
+      ct: res.headers.get('content-type'),
+      cl: res.headers.get('content-length'),
+      ms: Date.now() - t0
     });
 
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       const loc = res.headers.get('location');
       if (!loc) return res;
       cancelBody(res);
-      if (++redirects > MAX_REDIRECTS) throw new Error('重定向次数过多');
+      if (++redirects > MAX_REDIRECTS) {
+        if (tag) log(tag, 'redirect', 'too many', { count: redirects });
+        throw new Error('重定向次数过多');
+      }
 
       if (res.status === 303 ||
           ((res.status === 301 || res.status === 302) && method !== 'GET' && method !== 'HEAD')) {
@@ -282,7 +393,14 @@ async function safeFetch(rawUrl, init, options) {
         body = undefined;
         delete baseHeaders['content-type'];
       }
-      current = new URL(loc, current).href;
+      const next = new URL(loc, current).href;
+      if (tag) log(tag, 'redirect', 'follow', {
+        from: briefUrl(current),
+        to: briefUrl(next),
+        status: res.status,
+        method
+      });
+      current = next;
       continue;
     }
     return res;
@@ -290,22 +408,22 @@ async function safeFetch(rawUrl, init, options) {
 }
 
 // ═══════════════════════════════════════════════
-// GET / HEAD —— 按 MIME 分流
+// GET / HEAD 分发
 // ═══════════════════════════════════════════════
-async function handleDownload(req, res, targetUrl, options) {
+async function handleDownload(req, res, targetUrl, options, tag) {
   const headers = buildForwardHeaders(req);
   const isHead = req.method === 'HEAD';
 
-  // 探测：Range: 0-0 判断是否支持分片，同时拿到 Content-Type
   let probe;
   try {
     probe = await safeFetch(targetUrl, {
       method: 'GET',
       headers: { ...headers, Range: 'bytes=0-0' },
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
-    }, options);
+    }, options, tag);
   } catch (err) {
-    return sendError(res, 502, `无法连接源站：${err.message}`);
+    logErr(tag, 'probe', 'failed', err);
+    return sendError(res, 502, `无法连接源站：${err.message}`, tag);
   }
 
   const probeCT = probe.headers.get('content-type') || '';
@@ -314,59 +432,90 @@ async function handleDownload(req, res, targetUrl, options) {
   const mime = getMimeType(probeCT);
   cancelBody(probe);
 
-  // HEAD：不再拉 body，直接转发头
+  log(tag, 'probe', 'result', {
+    status: probeStatus,
+    mime,
+    cr: probeCR || undefined,
+    head: isHead
+  });
+
   if (isHead) {
-    return handleHead(req, res, targetUrl, headers, options);
+    log(tag, 'route', 'head');
+    return handleHead(req, res, targetUrl, headers, options, tag);
   }
 
-  // 1) HTML → 重写
   if (isHtmlMime(mime)) {
-    return handleHtml(req, res, targetUrl, headers, options);
+    log(tag, 'route', 'html');
+    return handleHtml(req, res, targetUrl, headers, options, tag);
   }
 
-  // 2) 视频 → 只取第一帧
   if (isVideoMime(mime)) {
-    return handleVideoPreview(req, res, targetUrl, headers, options);
+    log(tag, 'route', 'video-preview');
+    return handleVideoPreview(req, res, targetUrl, headers, options, tag);
   }
 
-  // 3) JS / CSS / 图片 / 音频 → 完整代理（优先分片）
   if (isUnrestrictedMime(mime)) {
     if (probeStatus === 206) {
       const totalSize = parseContentRangeTotal(probeCR);
       if (totalSize > 1) {
-        return streamMultiChunk(req, res, targetUrl, headers, totalSize, probe.headers, options);
+        log(tag, 'route', 'chunked-unrestricted', { totalSize });
+        return streamMultiChunk(req, res, targetUrl, headers, totalSize, probe.headers, options, tag);
       }
     }
-    return streamFallback(req, res, targetUrl, headers, options);
+    log(tag, 'route', 'stream-unrestricted');
+    return streamFallback(req, res, targetUrl, headers, options, tag);
   }
 
-  // 4) 其它类型 → 完整代理
   if (probeStatus === 206) {
     const totalSize = parseContentRangeTotal(probeCR);
     if (totalSize > 1) {
-      return streamMultiChunk(req, res, targetUrl, headers, totalSize, probe.headers, options);
+      log(tag, 'route', 'chunked-default', { totalSize });
+      return streamMultiChunk(req, res, targetUrl, headers, totalSize, probe.headers, options, tag);
     }
   }
-  return streamFallback(req, res, targetUrl, headers, options);
+  log(tag, 'route', 'stream-default');
+  return streamFallback(req, res, targetUrl, headers, options, tag);
 }
 
-// ── HEAD：纯头转发 ──
-async function handleHead(req, res, targetUrl, headers, options) {
+// ── HEAD ──
+async function handleHead(req, res, targetUrl, headers, options, tag) {
   let response;
   try {
     response = await safeFetch(targetUrl, {
       method: 'HEAD',
       headers,
       signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
-    }, options);
+    }, options, tag);
   } catch (err) {
-    return sendError(res, 502, `无法连接源站：${err.message}`);
+    // HEAD 405/501 时降级为 GET + Range 0-0
+    if (/40[15]|50[15]/.test(String(err && err.message))) {
+      log(tag, 'head', 'fallback to GET Range');
+      try {
+        response = await safeFetch(targetUrl, {
+          method: 'GET',
+          headers: { ...headers, Range: 'bytes=0-0' },
+          signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
+        }, options, tag);
+      } catch (err2) {
+        logErr(tag, 'head', 'fallback failed', err2);
+        return sendError(res, 502, `无法连接源站：${err2.message}`, tag);
+      }
+    } else {
+      logErr(tag, 'head', 'failed', err);
+      return sendError(res, 502, `无法连接源站：${err.message}`, tag);
+    }
   }
 
   res.statusCode = response.status;
   for (const [k, v] of response.headers) {
     const lk = k.toLowerCase();
     if (HOP_BY_HOP.has(lk)) continue;
+    if (lk === 'content-length' && response.headers.get('content-range')) {
+      // Range 0-0 时不要暴露 1 字节长度给 HEAD 客户端
+      const total = parseContentRangeTotal(response.headers.get('content-range'));
+      if (total > 0) res.setHeader('Content-Length', String(total));
+      continue;
+    }
     res.setHeader(k, v);
   }
   for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
@@ -376,9 +525,9 @@ async function handleHead(req, res, targetUrl, headers, options) {
 }
 
 // ═══════════════════════════════════════════════
-// 视频预览：只取前 VIDEO_PREVIEW_BYTES 字节
+// 视频预览
 // ═══════════════════════════════════════════════
-async function handleVideoPreview(req, res, targetUrl, headers, options) {
+async function handleVideoPreview(req, res, targetUrl, headers, options, tag) {
   const previewLimit = VIDEO_PREVIEW_BYTES;
 
   let start = 0;
@@ -391,6 +540,7 @@ async function handleVideoPreview(req, res, targetUrl, headers, options) {
       const s = parseInt(m[1], 10);
       if (Number.isFinite(s)) {
         if (s >= previewLimit) {
+          log(tag, 'video', 'range beyond preview', { start: s, limit: previewLimit });
           res.statusCode = 416;
           res.setHeader('Content-Range', `bytes */${previewLimit}`);
           res.setHeader('Accept-Ranges', 'bytes');
@@ -412,30 +562,40 @@ async function handleVideoPreview(req, res, targetUrl, headers, options) {
       method: 'GET',
       headers: { ...headers, Range: `bytes=${start}-${end}` },
       signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
-    }, options);
+    }, options, tag);
   } catch (err) {
-    return sendError(res, 502, `无法连接源站：${err.message}`);
+    logErr(tag, 'video', 'fetch failed', err);
+    return sendError(res, 502, `无法连接源站：${err.message}`, tag);
   }
 
   if (response.status !== 200 && response.status !== 206) {
-    return relayResponse(response, res);
+    log(tag, 'video', 'upstream non-2xx, relay', { status: response.status });
+    return relayResponse(response, res, tag);
   }
 
-  // 流式限额读取：无论源站是否支持 Range，最多读 limit 字节
   const limit = end - start + 1;
   let bodyBuf;
   try {
     bodyBuf = await readLimitedBody(response, limit);
   } catch (err) {
-    return sendError(res, 502, `读取视频失败：${err.message}`);
+    logErr(tag, 'video', 'read failed', err);
+    return sendError(res, 502, `读取视频失败：${err.message}`, tag);
   }
 
   if (bodyBuf.length === 0) {
-    return sendError(res, 502, '视频源站返回空响应');
+    log(tag, 'video', 'empty body');
+    return sendError(res, 502, '视频源站返回空响应', tag);
   }
 
   const totalSize = parseContentRangeTotal(response.headers.get('content-range') || '');
   const realEnd = start + bodyBuf.length - 1;
+
+  log(tag, 'video', 'preview served', {
+    bytes: bodyBuf.length,
+    range: `${start}-${realEnd}`,
+    total: totalSize || 'unknown',
+    upstreamStatus: response.status
+  });
 
   res.statusCode = 206;
   res.setHeader('Content-Type', response.headers.get('content-type') || 'video/mp4');
@@ -454,7 +614,6 @@ async function handleVideoPreview(req, res, targetUrl, headers, options) {
   res.end(bodyBuf);
 }
 
-// 流式读取，上限 limit 字节，超出即取消
 async function readLimitedBody(response, limit) {
   if (!response.body) return Buffer.alloc(0);
 
@@ -483,62 +642,84 @@ async function readLimitedBody(response, limit) {
 // ═══════════════════════════════════════════════
 // 通用流式回源
 // ═══════════════════════════════════════════════
-async function streamFallback(req, res, targetUrl, headers, options) {
+async function streamFallback(req, res, targetUrl, headers, options, tag) {
   let response;
   try {
     response = await safeFetch(targetUrl, {
       method: req.method,
       headers,
       signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
-    }, options);
+    }, options, tag);
   } catch (err) {
-    return sendError(res, 502, `无法连接源站：${err.message}`);
+    logErr(tag, 'stream', 'fetch failed', err);
+    return sendError(res, 502, `无法连接源站：${err.message}`, tag);
   }
-  return relayResponse(response, res);
+  return relayResponse(response, res, tag);
 }
 
 // ═══════════════════════════════════════════════
-// HTML 处理
+// HTML
 // ═══════════════════════════════════════════════
-async function handleHtml(req, res, targetUrl, headers, options) {
+async function handleHtml(req, res, targetUrl, headers, options, tag) {
   let response;
   try {
     response = await safeFetch(targetUrl, {
       method: 'GET',
       headers: { ...headers, 'accept-encoding': 'identity' },
       signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
-    }, options);
+    }, options, tag);
   } catch (err) {
-    return sendError(res, 502, `无法连接源站：${err.message}`);
+    logErr(tag, 'html', 'fetch failed', err);
+    return sendError(res, 502, `无法连接源站：${err.message}`, tag);
   }
 
   const ctRaw = response.headers.get('content-type') || '';
-  if (!isHtmlMime(getMimeType(ctRaw))) return relayResponse(response, res);
+  if (!isHtmlMime(getMimeType(ctRaw))) {
+    log(tag, 'html', 'content-type not html, relay', { ct: ctRaw });
+    return relayResponse(response, res, tag);
+  }
 
   const enc = response.headers.get('content-encoding');
-  if (enc && enc !== 'identity') return relayResponse(response, res);
+  if (enc && enc !== 'identity') {
+    log(tag, 'html', 'compressed, relay', { enc });
+    return relayResponse(response, res, tag);
+  }
 
   const declaredLen = parseInt(response.headers.get('content-length') || '0', 10);
-  if (declaredLen > HTML_MAX_BYTES) return relayResponse(response, res);
+  if (declaredLen > HTML_MAX_BYTES) {
+    log(tag, 'html', 'too large (declared), relay', { declaredLen });
+    return relayResponse(response, res, tag);
+  }
 
-  // 读取前最后一次检查：这里之后不能再 relayResponse
   let rawBuf;
   try {
     rawBuf = Buffer.from(await response.arrayBuffer());
   } catch (err) {
-    return sendError(res, 502, `读取 HTML 失败：${err.message}`);
+    logErr(tag, 'html', 'read failed', err);
+    return sendError(res, 502, `读取 HTML 失败：${err.message}`, tag);
   }
 
-  // body 已被消费，超限 / 重写失败都直接返回已读 buffer
   if (rawBuf.length > HTML_MAX_BYTES) {
+    log(tag, 'html', 'too large (actual), passthrough', { size: rawBuf.length });
     return sendBufferedResponse(res, response, rawBuf);
   }
 
   const finalUrl = response.url || targetUrl;
+  const t0 = Date.now();
   const outBuf = rewriteHtmlBody(rawBuf, ctRaw, finalUrl, options);
   if (!outBuf) {
+    log(tag, 'html', 'rewrite failed, passthrough', {
+      size: rawBuf.length,
+      ms: Date.now() - t0
+    });
     return sendBufferedResponse(res, response, rawBuf);
   }
+
+  log(tag, 'html', 'rewritten', {
+    in: rawBuf.length,
+    out: outBuf.length,
+    ms: Date.now() - t0
+  });
 
   res.statusCode = response.status;
   for (const [k, v] of response.headers) {
@@ -561,7 +742,6 @@ async function handleHtml(req, res, targetUrl, headers, options) {
   res.end(outBuf);
 }
 
-// body 已消费后，直接把 buffer 返回（保持原 Content-Type / charset）
 function sendBufferedResponse(res, response, buf) {
   res.statusCode = response.status;
   for (const [k, v] of response.headers) {
@@ -576,18 +756,23 @@ function sendBufferedResponse(res, response, buf) {
 }
 
 // ═══════════════════════════════════════════════
-// 多分片下载
+// 多分片
 // ═══════════════════════════════════════════════
-async function streamMultiChunk(req, res, targetUrl, headers, totalSize, upstreamHeaders, options) {
+async function streamMultiChunk(req, res, targetUrl, headers, totalSize, upstreamHeaders, options, tag) {
   const chunkCount = pickChunkCount(totalSize);
   const ranges = splitRanges(totalSize, chunkCount);
+
+  log(tag, 'chunk', 'start', {
+    totalSize,
+    chunks: chunkCount,
+    concurrency: Math.min(chunkCount, MAX_CONCURRENCY)
+  });
 
   res.statusCode = 200;
   res.setHeader('Content-Type', upstreamHeaders.get('content-type') || 'application/octet-stream');
   res.setHeader('Content-Length', String(totalSize));
   res.setHeader('Accept-Ranges', 'bytes');
 
-  // 转发上游非敏感响应头
   for (const [k, v] of upstreamHeaders) {
     const lk = k.toLowerCase();
     if (HOP_BY_HOP.has(lk)) continue;
@@ -599,7 +784,14 @@ async function streamMultiChunk(req, res, targetUrl, headers, totalSize, upstrea
 
   const buffers = new Array(chunkCount).fill(null);
   let writeIndex = 0, nextIndex = 0, failed = null, aborted = false;
-  res.on('close', () => { aborted = true; });
+  let doneCount = 0;
+
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      aborted = true;
+      log(tag, 'chunk', 'client closed', { writeIndex, doneCount, total: chunkCount });
+    }
+  });
 
   const worker = async () => {
     while (true) {
@@ -612,9 +804,10 @@ async function streamMultiChunk(req, res, targetUrl, headers, totalSize, upstrea
       if (i >= chunkCount) return;
 
       try {
-        const buf = await fetchChunkWithRetry(targetUrl, headers, ranges[i], options);
+        const buf = await fetchChunkWithRetry(targetUrl, headers, ranges[i], options, tag, i, chunkCount);
         if (failed || aborted) return;
         buffers[i] = buf;
+        doneCount++;
 
         while (writeIndex < chunkCount && buffers[writeIndex] !== null) {
           const chunk = buffers[writeIndex];
@@ -631,11 +824,17 @@ async function streamMultiChunk(req, res, targetUrl, headers, totalSize, upstrea
   const concurrency = Math.min(chunkCount, MAX_CONCURRENCY);
   await Promise.all(Array.from({ length: concurrency }, () => worker().catch(() => {})));
 
-  if (failed && !aborted) { try { res.destroy(); } catch (_) {} return; }
-  if (!aborted) { try { res.end(); } catch (_) {} }
+  if (failed && !aborted) {
+    logErr(tag, 'chunk', 'failed', failed);
+    try { res.destroy(); } catch (_) {}
+    return;
+  }
+  if (!aborted) {
+    log(tag, 'chunk', 'completed', { total: chunkCount, ms: 0 });
+    try { res.end(); } catch (_) {}
+  }
 }
 
-// 带背压的写入：res 关闭 / 出错 / drain 三事件竞速
 function writeWithBackpressure(res, chunk) {
   if (res.write(chunk)) return Promise.resolve();
 
@@ -654,7 +853,7 @@ function writeWithBackpressure(res, chunk) {
   });
 }
 
-async function fetchChunkWithRetry(targetUrl, headers, range, options) {
+async function fetchChunkWithRetry(targetUrl, headers, range, options, tag, idx, total) {
   let lastErr;
   for (let attempt = 0; attempt < CHUNK_MAX_RETRY; attempt++) {
     let response;
@@ -663,9 +862,10 @@ async function fetchChunkWithRetry(targetUrl, headers, range, options) {
         method: 'GET',
         headers: { ...headers, Range: `bytes=${range.start}-${range.end}` },
         signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
-      }, options);
+      }, options, tag);
     } catch (err) {
       lastErr = err;
+      if (tag) log(tag, 'chunk', 'retry', { idx, attempt, err: err.message });
       if (attempt < CHUNK_MAX_RETRY - 1) {
         await sleep(400 * Math.pow(2, attempt) + Math.random() * 200);
       }
@@ -675,6 +875,7 @@ async function fetchChunkWithRetry(targetUrl, headers, range, options) {
     if (response.status === 429 || response.status >= 500) {
       lastErr = new Error(`HTTP ${response.status}`);
       cancelBody(response);
+      if (tag) log(tag, 'chunk', 'retryable status', { idx, attempt, status: response.status });
       await sleep(400 * Math.pow(2, attempt) + Math.random() * 200);
       continue;
     }
@@ -682,8 +883,13 @@ async function fetchChunkWithRetry(targetUrl, headers, range, options) {
       cancelBody(response);
       throw new Error(`源站不支持分片：HTTP ${response.status}`);
     }
-    try { return Buffer.from(await response.arrayBuffer()); }
-    catch (err) { lastErr = err; }
+    try {
+      const buf = Buffer.from(await response.arrayBuffer());
+      if (tag && (attempt > 0 || idx < 3 || idx >= total - 3)) {
+        log(tag, 'chunk', 'ok', { idx, attempt, bytes: buf.length });
+      }
+      return buf;
+    } catch (err) { lastErr = err; }
   }
   throw lastErr || new Error('chunk download failed');
 }
@@ -715,19 +921,26 @@ function parseContentRangeTotal(cr) {
 // ═══════════════════════════════════════════════
 // POST / PUT / PATCH / DELETE
 // ═══════════════════════════════════════════════
-async function handleForward(req, res, targetUrl, options) {
+async function handleForward(req, res, targetUrl, options, tag) {
   const cl = req.headers['content-length'];
   if (cl && parseInt(cl, 10) > MAX_BODY_BYTES) {
-    return sendError(res, 413, '请求体过大，超过 4 MB 限制');
+    log(tag, 'forward', 'body too large (declared)', { cl });
+    return sendError(res, 413, '请求体过大，超过 4 MB 限制', tag);
   }
 
   let body;
   try {
     body = await readRequestBody(req);
   } catch (err) {
-    if (err.message === 'BODY_TOO_LARGE') return sendError(res, 413, '请求体过大');
-    return sendError(res, 400, `读取请求体失败：${err.message}`);
+    if (err.message === 'BODY_TOO_LARGE') {
+      log(tag, 'forward', 'body too large (actual)');
+      return sendError(res, 413, '请求体过大', tag);
+    }
+    logErr(tag, 'forward', 'read body failed', err);
+    return sendError(res, 400, `读取请求体失败：${err.message}`, tag);
   }
+
+  log(tag, 'forward', 'sending', { method: req.method, bodyBytes: body.length });
 
   const headers = buildForwardHeaders(req);
 
@@ -738,11 +951,12 @@ async function handleForward(req, res, targetUrl, options) {
       headers,
       body: body.length > 0 ? body : undefined,
       signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
-    }, options);
+    }, options, tag);
   } catch (err) {
-    return sendError(res, 502, `无法连接源站：${err.message}`);
+    logErr(tag, 'forward', 'fetch failed', err);
+    return sendError(res, 502, `无法连接源站：${err.message}`, tag);
   }
-  return relayResponse(response, res);
+  return relayResponse(response, res, tag);
 }
 
 async function readRequestBody(req) {
@@ -772,7 +986,7 @@ async function readRequestBody(req) {
 // ═══════════════════════════════════════════════
 // 响应中继
 // ═══════════════════════════════════════════════
-async function relayResponse(response, res) {
+async function relayResponse(response, res, tag) {
   res.statusCode = response.status;
 
   const contentEnc = response.headers.get('content-encoding');
@@ -786,24 +1000,42 @@ async function relayResponse(response, res) {
   }
   for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
 
-  if (!response.body) return res.end();
+  if (!response.body) {
+    if (tag) log(tag, 'relay', 'no body', { status: response.status });
+    return res.end();
+  }
+
+  if (tag) log(tag, 'relay', 'streaming', {
+    status: response.status,
+    ct: response.headers.get('content-type'),
+    cl: response.headers.get('content-length')
+  });
 
   const nodeStream = Readable.fromWeb(response.body);
+  const t0 = Date.now();
+  let bytes = 0;
+
+  nodeStream.on('data', (c) => { bytes += c.length; });
+
   await new Promise((resolve) => {
     let done = false;
     const finish = () => {
       if (done) return;
       done = true;
       try { nodeStream.destroy(); } catch (_) {}
+      if (tag) log(tag, 'relay', 'done', { bytes, ms: Date.now() - t0 });
       resolve();
     };
     res.on('close', finish);
-    nodeStream.on('error', () => { try { res.end(); } catch (_) {} finish(); });
+    nodeStream.on('error', (e) => {
+      if (tag) logErr(tag, 'relay', 'stream error', e);
+      try { res.end(); } catch (_) {}
+      finish();
+    });
     nodeStream.pipe(res).on('finish', finish);
   });
 }
 
-// 统一取消 body 的安全封装
 function cancelBody(response) {
   try {
     if (response && response.body && typeof response.body.cancel === 'function') {
@@ -818,6 +1050,7 @@ function cancelBody(response) {
 function parseRequest(req) {
   const raw = req.url || '';
 
+  // 标准代理模式：GET http://example.com/path HTTP/1.1
   if (/^https?:\/\//i.test(raw)) {
     try {
       const u = new URL(raw);
@@ -827,6 +1060,7 @@ function parseRequest(req) {
     } catch { return null; }
   }
 
+  // 路径模式：/https://example.com/path?x=1
   const qIdx = raw.indexOf('?');
   let path = qIdx >= 0 ? raw.slice(0, qIdx) : raw;
   let queryStr = qIdx >= 0 ? raw.slice(qIdx + 1) : '';
@@ -948,7 +1182,6 @@ const URL_ATTRS = new Set([
 
 function tuneVideoTag(node, ctx) {
   if (!node.attrs) return;
-
   node.attrs = node.attrs.filter((a) => a.name.toLowerCase() !== 'autoplay');
 
   const has = node.attrs.find((a) => a.name.toLowerCase() === 'preload');
@@ -965,9 +1198,7 @@ function rewriteDom(doc, ctx) {
   walkNode(doc, (node) => {
     if (!node.tagName || !node.attrs) return;
 
-    if (node.tagName === 'video') {
-      tuneVideoTag(node, ctx);
-    }
+    if (node.tagName === 'video') tuneVideoTag(node, ctx);
 
     for (const attr of node.attrs) {
       const n = attr.name.toLowerCase();
@@ -1130,9 +1361,9 @@ function rewriteInlineScript(src, ctx) {
 function isLikelyUrl(s) {
   if (!s || s.length < 4) return false;
   if (/^https?:\/\//i.test(s)) return true;
-  if (/^\/\//.test(s)) return true;                 // 协议相对 URL
-  if (/^\/[^/*]/.test(s)) return true;              // 站内绝对路径
-  if (/^\.\.?\//.test(s)) return true;              // 相对路径
+  if (/^\/\//.test(s)) return true;
+  if (/^\/[^/*]/.test(s)) return true;
+  if (/^\.\.?\//.test(s)) return true;
   return false;
 }
 
@@ -1169,7 +1400,7 @@ function buildForwardHeaders(req, override = {}) {
   const skip = new Set([
     'host', 'connection', 'content-length',
     'transfer-encoding', 'proxy-authorization',
-    'range', 'if-range'                          // 由函数内部按需生成
+    'range', 'if-range'
   ]);
   for (const [k, v] of Object.entries(req.headers)) {
     if (skip.has(k.toLowerCase())) continue;
@@ -1179,7 +1410,7 @@ function buildForwardHeaders(req, override = {}) {
   return Object.assign(headers, override);
 }
 
-function sendError(res, statusCode, msg) {
+function sendError(res, statusCode, msg, tag) {
   if (res.headersSent) { try { res.destroy(); } catch (_) {} return; }
   const body = Buffer.from(msg + '\n', 'utf8');
   res.statusCode = statusCode;
@@ -1187,4 +1418,5 @@ function sendError(res, statusCode, msg) {
   res.setHeader('Content-Length', String(body.length));
   for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
   res.end(body);
+  if (tag) log(tag, 'error', 'sent', { status: statusCode, msg });
 }
