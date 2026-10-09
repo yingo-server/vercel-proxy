@@ -4,5 +4,14 @@
   "private": true,
   "engines": {
     "node": "24.x"
+  },
+  "dependencies": {
+    "acorn": "^8.12.1",
+    "acorn-walk": "^8.3.3",
+    "content-type": "^1.0.5",
+    "iconv-lite": "^0.6.3",
+    "ipaddr.js": "^2.2.0",
+    "parse5": "^7.1.2",
+    "undici": "^6.19.8"
   }
 }
